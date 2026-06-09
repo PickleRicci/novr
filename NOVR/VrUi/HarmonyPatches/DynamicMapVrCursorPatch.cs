@@ -32,18 +32,38 @@ internal static class DynamicMapVrCursorPatch
         return true;
     }
 
+    private static bool IsVrActive => VrUiCursor.I != null && VrUiCursor.I.IsActive;
+
+    private static bool TryGetVrCursor(out VrUiCursor cursor, out Camera camera)
+    {
+        cursor = VrUiCursor.I;
+        camera = APIBus.CockpitHudCamera;
+        return cursor != null && cursor.IsActive && camera != null;
+    }
+
+    private static bool TryGetLocalCursorPoint(global::DynamicMap map, out Vector2 localPoint)
+    {
+        localPoint = Vector2.zero;
+        if (TryGetVrCursor(out var cursor, out var camera))
+        {
+            return RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                map.mapImage.GetComponent<RectTransform>(),
+                cursor.GetScreenPoint(),
+                camera,
+                out localPoint
+            );
+        }
+        return false;
+    }
+
     [HarmonyPatch(typeof(global::DynamicMap), "SelectFromMap")]
     private static class SelectFromMapPatch
     {
         [HarmonyPrefix]
         private static bool Prefix(global::DynamicMap __instance)
         {
-            var cursor = VrUiCursor.I;
-            if (cursor != null && cursor.IsActive)
+            if (TryGetVrCursor(out var cursor, out var camera))
             {
-                var camera = APIBus.CockpitHudCamera;
-                if (camera == null) return true;
-
                 // Calculate screen point exactly in the VR camera's screen/viewport space
                 // to match the coordinate system of iconWorldPositions projected via the same camera.
                 var cursorScreenPoint = (Vector2)camera.WorldToScreenPoint(cursor.CursorPosition);
@@ -76,16 +96,15 @@ internal static class DynamicMapVrCursorPatch
                 
                 foreach (var icon in icons)
                 {
-                    if (!IsSelectableMapIcon(icon)) continue;
-                    
-                    Vector3 iconWorldPosition = icon.transform.position;
-                    Vector2 iconScreenPoint = camera.WorldToScreenPoint(iconWorldPosition);
-                    
-                    float sqrDistance = (iconScreenPoint - cursorScreenPoint).sqrMagnitude;
-                    if (sqrDistance < closestSqrDistance)
+                    if (IsSelectableMapIcon(icon))
                     {
-                        closestSqrDistance = sqrDistance;
-                        closestIcon = icon;
+                        Vector2 iconScreenPoint = camera.WorldToScreenPoint(icon.transform.position);
+                        float sqrDistance = (iconScreenPoint - cursorScreenPoint).sqrMagnitude;
+                        if (sqrDistance < closestSqrDistance)
+                        {
+                            closestSqrDistance = sqrDistance;
+                            closestIcon = icon;
+                        }
                     }
                 }
                 
@@ -106,16 +125,11 @@ internal static class DynamicMapVrCursorPatch
         [HarmonyPrefix]
         private static bool Prefix(global::DynamicMap __instance, ref bool __result)
         {
-            var cursor = VrUiCursor.I;
-            if (cursor != null && cursor.IsActive)
+            if (TryGetVrCursor(out var cursor, out var camera))
             {
-                var camera = APIBus.CockpitHudCamera;
-                if (camera == null) return true;
-
-                var screenPoint = cursor.GetScreenPoint();
                 __result = RectTransformUtility.RectangleContainsScreenPoint(
                     __instance.mapBackground.rectTransform,
-                    screenPoint,
+                    cursor.GetScreenPoint(),
                     camera
                 );
                 return false;
@@ -130,25 +144,10 @@ internal static class DynamicMapVrCursorPatch
         [HarmonyPrefix]
         private static bool Prefix(global::DynamicMap __instance, ref global::GlobalPosition __result)
         {
-            var cursor = VrUiCursor.I;
-            if (cursor != null && cursor.IsActive)
+            if (TryGetLocalCursorPoint(__instance, out var localPoint))
             {
-                var camera = APIBus.CockpitHudCamera;
-                if (camera == null) return true;
-
-                var screenPoint = cursor.GetScreenPoint();
-                var mapImageRect = __instance.mapImage.GetComponent<RectTransform>();
-                
-                RectTransformUtility.ScreenPointToLocalPointInRectangle(
-                    mapImageRect,
-                    screenPoint,
-                    camera,
-                    out var localPoint
-                );
-                
                 float scaleFactor = __instance.mapDimension / 900.0f;
                 Vector2 worldCoords = localPoint * scaleFactor;
-                
                 __result = new global::GlobalPosition(worldCoords.x, 0f, worldCoords.y);
                 return false;
             }
@@ -162,11 +161,92 @@ internal static class DynamicMapVrCursorPatch
         [HarmonyPrefix]
         private static void Prefix(ref Vector3 __0)
         {
-            var cursor = VrUiCursor.I;
-            if (cursor != null && cursor.IsActive)
+            var dynamicMap = SceneSingleton<global::DynamicMap>.i;
+            if (dynamicMap != null && TryGetLocalCursorPoint(dynamicMap, out var localPoint))
             {
-                __0 = cursor.CursorPosition;
+                __0 = dynamicMap.mapImage.transform.TransformPoint(new Vector3(localPoint.x, localPoint.y, 0f));
             }
         }
     }
+
+    private static void AlignWaypoint(
+        GameObject marker,
+        GameObject vector,
+        ref Vector3 previousWaypoint,
+        float scale,
+        bool updateRotation)
+    {
+        marker.transform.localScale = Vector3.one * scale;
+        previousWaypoint = new Vector3(previousWaypoint.x, previousWaypoint.y, 0f);
+
+        Vector3 localMarkerPos = marker.transform.localPosition;
+        Vector3 delta = localMarkerPos - previousWaypoint;
+        delta.z = 0f;
+
+        if (updateRotation)
+        {
+            float angle = -Mathf.Atan2(delta.x, delta.y) * Mathf.Rad2Deg + 180f;
+            vector.transform.localEulerAngles = new Vector3(0f, 0f, angle);
+        }
+
+        vector.transform.localScale = new Vector3(4f * scale, delta.magnitude, 4f * scale);
+    }
+
+    [HarmonyPatch(typeof(global::MapWaypoint), "PlaceMarker")]
+    private static class MapWaypointPlaceMarkerPatch
+    {
+        [HarmonyPrefix]
+        private static bool Prefix(
+            global::MapWaypoint __instance,
+            ref Vector3 ___waypointPosition,
+            ref Vector3 ___previousWaypoint,
+            ref GameObject ___marker,
+            ref GameObject ___vector)
+        {
+            if (IsVrActive)
+            {
+                var dynamicMap = SceneSingleton<global::DynamicMap>.i;
+                if (dynamicMap == null) return true;
+
+                var iconLayer = dynamicMap.iconLayer.transform;
+                Vector3 localWaypoint = iconLayer.InverseTransformPoint(___waypointPosition);
+                localWaypoint.z = 0f;
+                Vector3 flatWaypointPosition = iconLayer.TransformPoint(localWaypoint);
+
+                ___waypointPosition = flatWaypointPosition;
+                ___marker.transform.position = flatWaypointPosition;
+                ___vector.transform.position = flatWaypointPosition;
+
+                float scale = 1f / dynamicMap.mapImage.transform.localScale.x;
+                AlignWaypoint(___marker, ___vector, ref ___previousWaypoint, scale, updateRotation: true);
+                return false;
+            }
+            return true;
+        }
+    }
+
+    [HarmonyPatch(typeof(global::MapWaypoint), "UpdateMarker")]
+    private static class MapWaypointUpdateMarkerPatch
+    {
+        [HarmonyPrefix]
+        private static bool Prefix(
+            global::MapWaypoint __instance,
+            ref Vector3 ___waypointPosition,
+            ref Vector3 ___previousWaypoint,
+            ref GameObject ___marker,
+            ref GameObject ___vector)
+        {
+            if (IsVrActive)
+            {
+                var dynamicMap = SceneSingleton<global::DynamicMap>.i;
+                if (dynamicMap == null || ___marker == null || ___vector == null) return true;
+
+                float scale = 1f / dynamicMap.mapImage.transform.localScale.x;
+                AlignWaypoint(___marker, ___vector, ref ___previousWaypoint, scale, updateRotation: false);
+                return false;
+            }
+            return true;
+        }
+    }
 }
+
